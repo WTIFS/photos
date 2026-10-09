@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.app.Application
 import android.content.ContentUris
+import android.content.ContentResolver
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -23,6 +24,7 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
@@ -41,11 +43,14 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -59,6 +64,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -68,6 +74,7 @@ import java.io.FileOutputStream
 import java.text.DateFormat
 import java.util.Date
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,12 +90,34 @@ data class PhotoAsset(val uri: Uri, val takenAt: Long, val displayName: String) 
 class PhotosViewModel(application: Application) : AndroidViewModel(application) {
     var photos by mutableStateOf<List<PhotoAsset>>(emptyList())
         private set
+    var trashedPhotos by mutableStateOf<List<PhotoAsset>>(emptyList())
+        private set
 
     suspend fun loadPhotos() {
-        photos = withContext(Dispatchers.IO) {
+        photos = queryPhotos(MediaStore.MATCH_EXCLUDE)
+    }
+
+    suspend fun loadTrashedPhotos() {
+        trashedPhotos = queryPhotos(MediaStore.MATCH_ONLY)
+    }
+
+    private suspend fun queryPhotos(matchTrashed: Int): List<PhotoAsset> {
+        return withContext(Dispatchers.IO) {
             val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
-            val projection = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATE_TAKEN, MediaStore.Images.Media.DISPLAY_NAME)
-            getApplication<Application>().contentResolver.query(collection, projection, null, null, "${MediaStore.Images.Media.DATE_TAKEN} DESC")?.use { cursor ->
+            val projection = arrayOf(
+                MediaStore.Images.Media._ID,
+                MediaStore.Images.Media.DATE_TAKEN,
+                MediaStore.Images.Media.DATE_ADDED,
+                MediaStore.Images.Media.DISPLAY_NAME,
+            )
+            val queryArgs = Bundle().apply {
+                putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, matchTrashed)
+                putString(
+                    ContentResolver.QUERY_ARG_SQL_SORT_ORDER,
+                    "${MediaStore.Images.Media.DATE_ADDED} DESC, ${MediaStore.Images.Media._ID} DESC",
+                )
+            }
+            getApplication<Application>().contentResolver.query(collection, projection, queryArgs, null)?.use { cursor ->
                 val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
                 val dateColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
                 val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
@@ -104,36 +133,80 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
 private fun PhotosApp(photosViewModel: PhotosViewModel = viewModel()) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val preferences = remember(context) { context.getSharedPreferences("photos_preferences", android.content.Context.MODE_PRIVATE) }
+    val colors = MaterialTheme.colorScheme
     val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
     var accessGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) }
     var viewerIndex by rememberSaveable { mutableStateOf<Int?>(null) }
+    var showingTrash by rememberSaveable { mutableStateOf(false) }
+    var gridColumns by rememberSaveable { mutableIntStateOf(preferences.getInt("grid_columns", 3).coerceIn(3, 4)) }
     val libraryGridState = rememberLazyGridState()
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { accessGranted = it }
-    val deleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+    val trashLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            scope.launch { photosViewModel.loadPhotos() }
+            scope.launch {
+                photosViewModel.loadPhotos()
+                photosViewModel.loadTrashedPhotos()
+            }
             viewerIndex = null
+        }
+    }
+    val permanentDeleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            scope.launch {
+                photosViewModel.loadPhotos()
+                photosViewModel.loadTrashedPhotos()
+            }
         }
     }
 
     LaunchedEffect(accessGranted) { if (accessGranted) photosViewModel.loadPhotos() }
-    val requestDelete: (List<PhotoAsset>) -> Unit = { assets ->
+    val requestTrash: (List<PhotoAsset>) -> Unit = { assets ->
+        val request = MediaStore.createTrashRequest(context.contentResolver, assets.map { it.uri }, true)
+        trashLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+    }
+    val requestPermanentDelete: (List<PhotoAsset>) -> Unit = { assets ->
         val request = MediaStore.createDeleteRequest(context.contentResolver, assets.map { it.uri })
-        deleteLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+        permanentDeleteLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
+    }
+    val requestRestore: (List<PhotoAsset>) -> Unit = { assets ->
+        val request = MediaStore.createTrashRequest(context.contentResolver, assets.map { it.uri }, false)
+        trashLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
     }
 
-    MaterialTheme {
-        Box(Modifier.fillMaxSize().background(Color.Black)) {
+    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
             when {
                 !accessGranted -> PermissionView { permissionLauncher.launch(permission) }
+                showingTrash -> TrashScreen(
+                    photos = photosViewModel.trashedPhotos,
+                    columns = gridColumns,
+                    onBack = { showingTrash = false },
+                    onRestore = requestRestore,
+                    onPermanentDelete = requestPermanentDelete,
+                )
                 photosViewModel.photos.isEmpty() -> EmptyGalleryView()
-                viewerIndex == null -> LibraryScreen(photosViewModel.photos, libraryGridState, onOpen = { viewerIndex = it }, onDelete = requestDelete)
+                viewerIndex == null -> LibraryScreen(
+                    photos = photosViewModel.photos,
+                    gridState = libraryGridState,
+                    columns = gridColumns,
+                    onColumnsChange = { columns ->
+                        gridColumns = columns
+                        preferences.edit().putInt("grid_columns", columns).apply()
+                    },
+                    onOpen = { viewerIndex = it },
+                    onDelete = requestTrash,
+                    onOpenTrash = {
+                        scope.launch { photosViewModel.loadTrashedPhotos() }
+                        showingTrash = true
+                    },
+                )
                 else -> PhotoViewer(
                     photos = photosViewModel.photos,
                     initialIndex = viewerIndex!!.coerceIn(0, photosViewModel.photos.lastIndex),
                     onPageChanged = { viewerIndex = it },
                     onClose = { viewerIndex = null },
-                    onDelete = { requestDelete(listOf(it)) },
+                    onDelete = { requestTrash(listOf(it)) },
                 )
             }
         }
@@ -158,42 +231,127 @@ private fun EmptyGalleryView() = Box(Modifier.fillMaxSize(), contentAlignment = 
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun LibraryScreen(photos: List<PhotoAsset>, gridState: LazyGridState, onOpen: (Int) -> Unit, onDelete: (List<PhotoAsset>) -> Unit) {
+private fun LibraryScreen(
+    photos: List<PhotoAsset>,
+    gridState: LazyGridState,
+    columns: Int,
+    onColumnsChange: (Int) -> Unit,
+    onOpen: (Int) -> Unit,
+    onDelete: (List<PhotoAsset>) -> Unit,
+    onOpenTrash: () -> Unit,
+) {
     var selectedUris by remember { mutableStateOf(setOf<Uri>()) }
+    var moreMenuExpanded by remember { mutableStateOf(false) }
     val selecting = selectedUris.isNotEmpty()
-    Column(Modifier.fillMaxSize().background(Color(0xFF101010))) {
+    val colors = MaterialTheme.colorScheme
+    Column(Modifier.fillMaxSize().background(colors.background)) {
         Row(Modifier.fillMaxWidth().statusBarsPadding().height(64.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(if (selecting) "${selectedUris.size} Selected" else "Library", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Text(if (selecting) "${selectedUris.size} Selected" else "Library", color = colors.onBackground, fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
             if (selecting) {
-                IconButton(onClick = { selectedUris = photos.map { it.uri }.toSet() }) { Icon(Icons.Outlined.SelectAll, "Select all", tint = Color.White) }
-                IconButton(onClick = { onDelete(photos.filter { it.uri in selectedUris }); selectedUris = emptySet() }) { Icon(Icons.Outlined.DeleteOutline, "Delete selected", tint = Color(0xFFFF6B5E)) }
+                IconButton(onClick = { selectedUris = photos.map { it.uri }.toSet() }) { Icon(Icons.Outlined.SelectAll, "Select all", tint = colors.onBackground) }
+                IconButton(onClick = { onDelete(photos.filter { it.uri in selectedUris }); selectedUris = emptySet() }) { Icon(Icons.Outlined.DeleteOutline, "Move selected photos to trash", tint = Color(0xFFFF6B5E)) }
             } else {
-                IconButton(onClick = {}) { Icon(Icons.Outlined.MoreHoriz, "More library actions", tint = Color.White) }
+                Box {
+                    IconButton(onClick = { moreMenuExpanded = true }) { Icon(Icons.Outlined.MoreHoriz, "More library actions", tint = colors.onBackground) }
+                    DropdownMenu(expanded = moreMenuExpanded, onDismissRequest = { moreMenuExpanded = false }) {
+                        DropdownMenuItem(
+                            text = { Text("3 columns") },
+                            trailingIcon = { if (columns == 3) Icon(Icons.Outlined.Check, null) },
+                            onClick = { moreMenuExpanded = false; onColumnsChange(3) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("4 columns") },
+                            trailingIcon = { if (columns == 4) Icon(Icons.Outlined.Check, null) },
+                            onClick = { moreMenuExpanded = false; onColumnsChange(4) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Trash") },
+                            leadingIcon = { Icon(Icons.Outlined.DeleteOutline, null) },
+                            onClick = { moreMenuExpanded = false; onOpenTrash() },
+                        )
+                    }
+                }
             }
         }
-        Text("${photos.size} Photos", color = Color(0xFF969696), modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
-        LazyVerticalGrid(state = gridState, columns = GridCells.Fixed(3), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp), modifier = Modifier.fillMaxSize()) {
-            items(photos, key = { it.uri }) { asset ->
-                val selected = asset.uri in selectedUris
-                Box(
-                    Modifier.padding(1.dp).height(132.dp).fillMaxWidth()
-                        .pointerInput(selecting) {
+        Text("${photos.size} Photos", color = colors.onBackground.copy(alpha = 0.58f), modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+        Box(Modifier.weight(1f)) {
+            LazyVerticalGrid(state = gridState, columns = GridCells.Fixed(columns), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp), modifier = Modifier.fillMaxSize()) {
+                items(photos, key = { it.uri }) { asset ->
+                    val selected = asset.uri in selectedUris
+                    Box(
+                        Modifier.padding(1.dp).fillMaxWidth()
+                            .then(if (columns == 4) Modifier.aspectRatio(1f) else Modifier.height(132.dp))
+                            .pointerInput(selecting) {
+                                detectTapGestures(
+                                    onTap = { if (selecting) selectedUris = selectedUris.toggle(asset.uri) else onOpen(photos.indexOf(asset)) },
+                                    onLongPress = { selectedUris = selectedUris.toggle(asset.uri) },
+                                )
+                            },
+                    ) {
+                        AsyncImage(ImageRequest.Builder(LocalContext.current).data(asset.uri).size(400).build(), "Photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                        if (asset.mayContainLiveClip) {
+                            Box(
+                                Modifier.align(Alignment.TopStart).padding(7.dp).size(24.dp).clip(RoundedCornerShape(50)).background(Color(0xAA000000)),
+                                contentAlignment = Alignment.Center,
+                            ) { Icon(Icons.Outlined.PlayArrow, "Live photo", tint = Color.White, modifier = Modifier.size(16.dp)) }
+                        }
+                        if (selected) Box(Modifier.fillMaxSize().background(Color(0x550A84FF)))
+                        if (selecting) SelectionBadge(selected, Modifier.align(Alignment.TopEnd).padding(8.dp))
+                    }
+                }
+            }
+            GalleryScrollIndicator(gridState, photos.size)
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun TrashScreen(
+    photos: List<PhotoAsset>,
+    columns: Int,
+    onBack: () -> Unit,
+    onRestore: (List<PhotoAsset>) -> Unit,
+    onPermanentDelete: (List<PhotoAsset>) -> Unit,
+) {
+    val gridState = rememberLazyGridState()
+    var selectedUris by remember { mutableStateOf(setOf<Uri>()) }
+    val selecting = selectedUris.isNotEmpty()
+    val colors = MaterialTheme.colorScheme
+    Column(Modifier.fillMaxSize().background(colors.background)) {
+        Row(Modifier.fillMaxWidth().statusBarsPadding().height(64.dp).padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.Outlined.ArrowBack, "Back to library", tint = colors.onBackground) }
+            Text(if (selecting) "${selectedUris.size} Selected" else "Trash", color = colors.onBackground, fontSize = 28.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            if (selecting) {
+                IconButton(onClick = { onRestore(photos.filter { it.uri in selectedUris }); selectedUris = emptySet() }) {
+                    Icon(Icons.Outlined.Restore, "Restore selected photos", tint = colors.onBackground)
+                }
+                IconButton(onClick = { onPermanentDelete(photos.filter { it.uri in selectedUris }); selectedUris = emptySet() }) {
+                    Icon(Icons.Outlined.DeleteOutline, "Permanently delete selected photos", tint = Color(0xFFFF6B5E))
+                }
+            }
+        }
+        Text("${photos.size} Photos", color = colors.onBackground.copy(alpha = 0.58f), modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp))
+        if (photos.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Trash is empty", color = Color(0xFFB8B8B8), fontSize = 17.sp) }
+        } else {
+            Box(Modifier.weight(1f)) {
+                LazyVerticalGrid(state = gridState, columns = GridCells.Fixed(columns), contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp), modifier = Modifier.fillMaxSize()) {
+                    items(photos, key = { it.uri }) { asset ->
+                        val selected = asset.uri in selectedUris
+                        Box(Modifier.padding(1.dp).fillMaxWidth().then(if (columns == 4) Modifier.aspectRatio(1f) else Modifier.height(132.dp)).pointerInput(selecting) {
                             detectTapGestures(
-                                onTap = { if (selecting) selectedUris = selectedUris.toggle(asset.uri) else onOpen(photos.indexOf(asset)) },
+                                onTap = { if (selecting) selectedUris = selectedUris.toggle(asset.uri) },
                                 onLongPress = { selectedUris = selectedUris.toggle(asset.uri) },
                             )
-                        },
-                ) {
-                    AsyncImage(ImageRequest.Builder(LocalContext.current).data(asset.uri).size(400).build(), "Photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                    if (asset.mayContainLiveClip) {
-                        Box(
-                            Modifier.align(Alignment.TopStart).padding(7.dp).size(24.dp).clip(RoundedCornerShape(50)).background(Color(0xAA000000)),
-                            contentAlignment = Alignment.Center,
-                        ) { Icon(Icons.Outlined.PlayArrow, "Live photo", tint = Color.White, modifier = Modifier.size(16.dp)) }
+                        }) {
+                            AsyncImage(ImageRequest.Builder(LocalContext.current).data(asset.uri).size(400).build(), "Trashed photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            if (selected) Box(Modifier.fillMaxSize().background(Color(0x55FF453A)))
+                            if (selecting) SelectionBadge(selected, Modifier.align(Alignment.TopEnd).padding(8.dp))
+                        }
                     }
-                    if (selected) Box(Modifier.fillMaxSize().background(Color(0x550A84FF)))
-                    if (selecting) SelectionBadge(selected, Modifier.align(Alignment.TopEnd).padding(8.dp))
                 }
+                GalleryScrollIndicator(gridState, photos.size)
             }
         }
     }
@@ -207,11 +365,74 @@ private fun SelectionBadge(selected: Boolean, modifier: Modifier = Modifier) = B
 
 private fun Set<Uri>.toggle(uri: Uri): Set<Uri> = if (uri in this) this - uri else this + uri
 
+@Composable
+private fun GalleryScrollIndicator(gridState: LazyGridState, itemCount: Int) {
+    val firstIndex by remember { derivedStateOf { gridState.firstVisibleItemIndex } }
+    val visibleCount by remember { derivedStateOf { gridState.layoutInfo.visibleItemsInfo.size } }
+    if (itemCount <= visibleCount.coerceAtLeast(1)) return
+
+    val scope = rememberCoroutineScope()
+    val colors = MaterialTheme.colorScheme
+    var dragging by remember { mutableStateOf(false) }
+    var dragProgress by remember { mutableFloatStateOf(0f) }
+    var showThumb by remember { mutableStateOf(false) }
+    LaunchedEffect(gridState.isScrollInProgress, dragging) {
+        if (gridState.isScrollInProgress || dragging) {
+            showThumb = true
+        } else {
+            delay(550)
+            if (!gridState.isScrollInProgress && !dragging) showThumb = false
+        }
+    }
+    AnimatedVisibility(
+        visible = showThumb,
+        enter = fadeIn(),
+        exit = fadeOut(),
+        modifier = Modifier.fillMaxSize(),
+    ) {
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val visibleFraction = (visibleCount.toFloat() / itemCount).coerceIn(0.12f, 0.42f)
+        val thumbHeight = (maxHeight * visibleFraction).coerceIn(24.dp, 56.dp)
+        val travel = maxHeight - thumbHeight - 12.dp
+        val scrollProgress = (firstIndex.toFloat() / (itemCount - visibleCount).coerceAtLeast(1)).coerceIn(0f, 1f)
+        val progress = if (dragging) dragProgress else scrollProgress
+        val travelPx = with(LocalDensity.current) { travel.toPx().coerceAtLeast(1f) }
+
+        Box(
+            Modifier.align(Alignment.TopEnd)
+                .padding(end = 5.dp, top = 6.dp)
+                .offset { IntOffset(0, (travelPx * progress).roundToInt()) }
+                .width(14.dp)
+                .height(thumbHeight)
+                .clip(RoundedCornerShape(7.dp))
+                .background(colors.onBackground.copy(alpha = 0.88f))
+                .pointerInput(itemCount, visibleCount, travelPx) {
+                    detectDragGestures(
+                        onDragStart = {
+                            dragging = true
+                            dragProgress = scrollProgress
+                        },
+                        onDragEnd = { dragging = false },
+                        onDragCancel = { dragging = false },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            dragProgress = (dragProgress + dragAmount.y / travelPx).coerceIn(0f, 1f)
+                            val target = (dragProgress * (itemCount - 1)).roundToInt()
+                            scope.launch { gridState.scrollToItem(target) }
+                        },
+                    )
+                },
+        ) {
+            Box(Modifier.align(Alignment.Center).width(6.dp).height(2.dp).clip(RoundedCornerShape(1.dp)).background(colors.background.copy(alpha = 0.7f)))
+        }
+    }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChanged: (Int) -> Unit, onClose: () -> Unit, onDelete: (PhotoAsset) -> Unit) {
     var isDetail by rememberSaveable { mutableStateOf(false) }
-    BackHandler { if (isDetail) isDetail = false else onClose() }
     val context = LocalContext.current
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(initialPage = initialIndex, pageCount = { photos.size })
     val filmstripState = rememberLazyListState()
@@ -220,6 +441,15 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
     var centeringFilmstrip by remember { mutableStateOf(false) }
     var zoom by remember { mutableFloatStateOf(1f) }
     var pan by remember { mutableStateOf(Offset.Zero) }
+    BackHandler {
+        if (isDetail) {
+            isDetail = false
+            zoom = 1f
+            pan = Offset.Zero
+        } else {
+            onClose()
+        }
+    }
     val selected = pagerState.currentPage
     LaunchedEffect(selected) {
         onPageChanged(selected)
@@ -250,6 +480,7 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
                     pan = if (zoom > 1f) pan + panChange else Offset.Zero
                 },
                 onLongPress = { if (photos[selected].mayContainLiveClip) playingAsset = photos[selected] },
+                onExitDetail = { isDetail = false; zoom = 1f; pan = Offset.Zero },
             )
         } else {
             androidx.compose.foundation.pager.HorizontalPager(
@@ -293,7 +524,7 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
 }
 
 @Composable
-private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform: (Float, Offset) -> Unit, onLongPress: () -> Unit) {
+private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform: (Float, Offset) -> Unit, onLongPress: () -> Unit, onExitDetail: () -> Unit) {
     val transformState = rememberTransformableState { zoomChange, panChange, _ -> onTransform(zoomChange, panChange) }
     AsyncImage(
         model = ImageRequest.Builder(LocalContext.current).data(asset.uri).crossfade(true).build(),
@@ -301,7 +532,7 @@ private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform
         modifier = Modifier.fillMaxSize()
             .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = pan.x, translationY = pan.y)
             .transformable(transformState)
-            .pointerInput(asset.uri) { detectTapGestures(onLongPress = { onLongPress() }) },
+            .pointerInput(asset.uri) { detectTapGestures(onTap = { onExitDetail() }, onLongPress = { onLongPress() }) },
         contentScale = ContentScale.Fit,
     )
 }
@@ -321,7 +552,7 @@ private fun ViewerHeader(asset: PhotoAsset, onBack: () -> Unit, onPlay: (() -> U
             Text(DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(asset.takenAt)), color = Color.Black, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
         }
         if (onPlay != null) ViewerCircleButton(Icons.Outlined.PlayArrow, "Play live photo", onPlay) else Spacer(Modifier.size(8.dp))
-        ViewerCircleButton(Icons.Outlined.DeleteOutline, "Delete photo", onDelete)
+        ViewerCircleButton(Icons.Outlined.DeleteOutline, "Move photo to trash", onDelete)
     }
 }
 
