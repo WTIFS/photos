@@ -26,9 +26,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.calculateCentroidSize
 import androidx.compose.foundation.gestures.animateScrollBy
-import androidx.compose.foundation.gestures.rememberTransformableState
-import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -62,6 +66,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
@@ -224,7 +229,7 @@ private fun PhotosApp(photosViewModel: PhotosViewModel = viewModel()) {
         trashLauncher.launch(IntentSenderRequest.Builder(request.intentSender).build())
     }
 
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
+    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme(background = Color.White)) {
         Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
             when {
                 !accessGranted -> PermissionView { permissionLauncher.launch(permission) }
@@ -550,7 +555,7 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
         try { centerFilmstripItem(filmstripState, selected) } finally { centeringFilmstrip = false }
     }
     LaunchedEffect(filmstripState) {
-        snapshotFlow { filmstripState.centeredItemIndex() }
+        snapshotFlow { if (!isDetail && filmstripState.isScrollInProgress) filmstripState.centeredItemIndex() else null }
             .distinctUntilChanged()
             .collect { index ->
                 if (!centeringFilmstrip && index != null && index != pagerState.currentPage) pagerState.requestScrollToPage(index)
@@ -572,6 +577,11 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
                 },
                 onLongPress = { if (photos[selected].mayContainLiveClip) playingAsset = photos[selected] },
                 onExitDetail = { isDetail = false; zoom = 1f; pan = Offset.Zero },
+                onDoubleTap = { zoom = if (zoom > 1f) 1f else 4f; pan = Offset.Zero },
+                onSwitchPhoto = { direction ->
+                    val target = (selected + direction).coerceIn(0, photos.lastIndex)
+                    if (target != selected) scope.launch { pagerState.scrollToPage(target) }
+                },
             )
         } else {
             androidx.compose.foundation.pager.HorizontalPager(
@@ -579,13 +589,28 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
                 modifier = Modifier.fillMaxSize(),
                 beyondViewportPageCount = 1,
             ) { page ->
+                var dismissDistance by remember(photos[page].uri) { mutableFloatStateOf(0f) }
                 AsyncImage(
                     model = photoRequest(photos[page]),
                     contentDescription = "Photo ${page + 1}",
                     modifier = Modifier.fillMaxSize().pointerInput(page) {
                         detectTapGestures(
                             onTap = { isDetail = true },
+                            onDoubleTap = { zoom = 4f; pan = Offset.Zero; isDetail = true },
                             onLongPress = { if (photos[page].mayContainLiveClip) playingAsset = photos[page] },
+                        )
+                    }.pointerInput(photos[page].uri) {
+                        val dismissThreshold = 24.dp.toPx()
+                        detectVerticalDragGestures(
+                            onDragStart = { dismissDistance = 0f },
+                            onDragEnd = {
+                                if (abs(dismissDistance) >= dismissThreshold) onClose()
+                                dismissDistance = 0f
+                            },
+                            onDragCancel = { dismissDistance = 0f },
+                            onVerticalDrag = { _, amount ->
+                                dismissDistance += amount
+                            },
                         )
                     },
                     contentScale = ContentScale.Fit,
@@ -638,15 +663,57 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
 }
 
 @Composable
-private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform: (Float, Offset) -> Unit, onLongPress: () -> Unit, onExitDetail: () -> Unit) {
-    val transformState = rememberTransformableState { zoomChange, panChange, _ -> onTransform(zoomChange, panChange) }
+@OptIn(ExperimentalFoundationApi::class)
+private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform: (Float, Offset) -> Unit, onLongPress: () -> Unit, onExitDetail: () -> Unit, onDoubleTap: () -> Unit, onSwitchPhoto: (Int) -> Unit) {
+    val currentDoubleTap by rememberUpdatedState(onDoubleTap)
+    val currentSwitchPhoto by rememberUpdatedState(onSwitchPhoto)
+    val currentZoom by rememberUpdatedState(zoom)
+    val currentTransform by rememberUpdatedState(onTransform)
     AsyncImage(
         model = photoRequest(asset),
         contentDescription = "Photo detail",
         modifier = Modifier.fillMaxSize()
-            .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = pan.x, translationY = pan.y)
-            .transformable(transformState)
-            .pointerInput(asset.uri) { detectTapGestures(onTap = { onExitDetail() }, onLongPress = { onLongPress() }) },
+            .pointerInput(asset.uri) {
+                val switchThreshold = 48.dp.toPx()
+                // One recognizer owns swipes and pinches, so a second finger can always start zooming.
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    val startedZoomed = currentZoom > 1f
+                    var multipleFingers = false
+                    var distance = Offset.Zero
+                    var totalZoom = 1f
+                    var dragging = false
+                    var cancelled = false
+                    do {
+                        val event = awaitPointerEvent()
+                        multipleFingers = multipleFingers || event.changes.count { it.pressed || it.previousPressed } > 1
+                        cancelled = event.changes.any { it.isConsumed }
+                        if (!cancelled) {
+                            val zoomChange = event.calculateZoom()
+                            val panChange = event.calculatePan()
+                            distance += panChange
+                            totalZoom *= zoomChange
+                            if (!dragging) {
+                                val zoomMotion = abs(1f - totalZoom) * event.calculateCentroidSize(useCurrent = false)
+                                dragging = distance.getDistance() > viewConfiguration.touchSlop || zoomMotion > viewConfiguration.touchSlop
+                            }
+                            if (dragging) {
+                                if (multipleFingers || startedZoomed) currentTransform(zoomChange, panChange)
+                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                            }
+                        }
+                    } while (!cancelled && event.changes.any { it.pressed })
+                    if (!cancelled && !multipleFingers && !startedZoomed &&
+                        abs(distance.x) >= switchThreshold && abs(distance.x) > abs(distance.y)) {
+                        currentSwitchPhoto(if (distance.x < 0f) 1 else -1)
+                    }
+                }
+            }
+            .pointerInput(asset.uri) {
+                detectTapGestures(onTap = { onExitDetail() }, onDoubleTap = { currentDoubleTap() }, onLongPress = { onLongPress() })
+            }
+            // Keep gesture distances in screen pixels rather than scaled image coordinates.
+            .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = pan.x, translationY = pan.y),
         contentScale = ContentScale.Fit,
     )
 }
