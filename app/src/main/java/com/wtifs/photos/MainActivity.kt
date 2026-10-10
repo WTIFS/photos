@@ -21,6 +21,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -38,6 +39,10 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Favorite
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -48,7 +53,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.pointer.pointerInput
@@ -83,8 +93,20 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-data class PhotoAsset(val uri: Uri, val takenAt: Long, val displayName: String) {
+data class PhotoAsset(val uri: Uri, val takenAt: Long, val displayName: String, val favorite: Boolean = false, val modified: Long = 0) {
     val mayContainLiveClip: Boolean get() = displayName.startsWith("MVIMG_", ignoreCase = true)
+}
+
+// A saved rotation must invalidate every size of this image, including the filmstrip.
+private val imageRevisions = mutableStateMapOf<Uri, Int>()
+
+@Composable
+private fun photoRequest(asset: PhotoAsset, size: Int? = null): ImageRequest {
+    val builder = ImageRequest.Builder(LocalContext.current).data(asset.uri)
+        .memoryCacheKey("${asset.uri}:${asset.modified}:${imageRevisions[asset.uri] ?: 0}")
+        .diskCachePolicy(coil.request.CachePolicy.DISABLED)
+    if (size != null) builder.size(size)
+    return builder.build()
 }
 
 class PhotosViewModel(application: Application) : AndroidViewModel(application) {
@@ -109,6 +131,8 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
                 MediaStore.Images.Media.DATE_TAKEN,
                 MediaStore.Images.Media.DATE_ADDED,
                 MediaStore.Images.Media.DISPLAY_NAME,
+                MediaStore.Images.Media.IS_FAVORITE,
+                MediaStore.Images.Media.DATE_MODIFIED,
             )
             val queryArgs = Bundle().apply {
                 putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, matchTrashed)
@@ -122,7 +146,7 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
                 val dateColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
                 val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
                 buildList {
-                    while (cursor.moveToNext()) add(PhotoAsset(ContentUris.withAppendedId(collection, cursor.getLong(idColumn)), cursor.getLong(dateColumn), cursor.getString(nameColumn)))
+                    while (cursor.moveToNext()) add(PhotoAsset(ContentUris.withAppendedId(collection, cursor.getLong(idColumn)), cursor.getLong(dateColumn), cursor.getString(nameColumn), cursor.getInt(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.IS_FAVORITE)) == 1, cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED))))
                 }
             } ?: emptyList()
         }
@@ -141,6 +165,14 @@ private fun PhotosApp(photosViewModel: PhotosViewModel = viewModel()) {
     var showingTrash by rememberSaveable { mutableStateOf(false) }
     var gridColumns by rememberSaveable { mutableIntStateOf(preferences.getInt("grid_columns", 3).coerceIn(3, 4)) }
     val libraryGridState = rememberLazyGridState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, accessGranted) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME && accessGranted) scope.launch { photosViewModel.loadPhotos() }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { accessGranted = it }
     val trashLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
@@ -207,6 +239,7 @@ private fun PhotosApp(photosViewModel: PhotosViewModel = viewModel()) {
                     onPageChanged = { viewerIndex = it },
                     onClose = { viewerIndex = null },
                     onDelete = { requestTrash(listOf(it)) },
+                    onRefresh = { scope.launch { photosViewModel.loadPhotos() } },
                 )
             }
         }
@@ -288,14 +321,11 @@ private fun LibraryScreen(
                                 )
                             },
                     ) {
-                        AsyncImage(ImageRequest.Builder(LocalContext.current).data(asset.uri).size(400).build(), "Photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                        if (asset.mayContainLiveClip) {
-                            Box(
-                                Modifier.align(Alignment.TopStart).padding(7.dp).size(24.dp).clip(RoundedCornerShape(50)).background(Color(0xAA000000)),
-                                contentAlignment = Alignment.Center,
-                            ) { Icon(Icons.Outlined.PlayArrow, "Live photo", tint = Color.White, modifier = Modifier.size(16.dp)) }
-                        }
+                        AsyncImage(photoRequest(asset, 400), "Photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                         if (selected) Box(Modifier.fillMaxSize().background(Color(0x550A84FF)))
+                        val badgeSize = if (columns == 3) 18.dp else 15.dp
+                        if (asset.favorite) Icon(Icons.Filled.Favorite, "Favorite", tint = Color.White, modifier = Modifier.align(Alignment.BottomStart).padding(6.dp).size(badgeSize))
+                        if (asset.mayContainLiveClip) LivePhotoBadge(Modifier.align(Alignment.BottomEnd).padding(6.dp).size(badgeSize))
                         if (selecting) SelectionBadge(selected, Modifier.align(Alignment.TopEnd).padding(8.dp))
                     }
                 }
@@ -345,7 +375,7 @@ private fun TrashScreen(
                                 onLongPress = { selectedUris = selectedUris.toggle(asset.uri) },
                             )
                         }) {
-                            AsyncImage(ImageRequest.Builder(LocalContext.current).data(asset.uri).size(400).build(), "Trashed photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+                            AsyncImage(photoRequest(asset, 400), "Trashed photo", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                             if (selected) Box(Modifier.fillMaxSize().background(Color(0x55FF453A)))
                             if (selecting) SelectionBadge(selected, Modifier.align(Alignment.TopEnd).padding(8.dp))
                         }
@@ -431,9 +461,35 @@ private fun GalleryScrollIndicator(gridState: LazyGridState, itemCount: Int) {
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChanged: (Int) -> Unit, onClose: () -> Unit, onDelete: (PhotoAsset) -> Unit) {
+private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChanged: (Int) -> Unit, onClose: () -> Unit, onDelete: (PhotoAsset) -> Unit, onRefresh: () -> Unit) {
     var isDetail by rememberSaveable { mutableStateOf(false) }
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var metadata by remember { mutableStateOf(PhotoMetadata()) }
+    var showInfo by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var revision by remember { mutableIntStateOf(0) }
+    var busy by remember { mutableStateOf(false) }
+    var pendingRotation by rememberSaveable { mutableStateOf<String?>(null) }
+    var locationRevision by remember { mutableIntStateOf(0) }
+    val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { locationRevision++ }
+    val favoriteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
+        if (it.resultCode == Activity.RESULT_OK) onRefresh()
+    }
+    val rotateLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val asset = photos.firstOrNull { it.uri.toString() == pendingRotation }
+        pendingRotation = null
+        if (result.resultCode == Activity.RESULT_OK && asset != null) scope.launch {
+            busy = true
+            try {
+                withContext(Dispatchers.IO) { rotatePhotoLeft(context, asset) }
+                imageRevisions[asset.uri] = (imageRevisions[asset.uri] ?: 0) + 1
+                revision++
+                onRefresh()
+            } catch (e: Exception) { error = e.message ?: "Could not rotate this image." }
+            finally { busy = false }
+        }
+    }
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(initialPage = initialIndex, pageCount = { photos.size })
     val filmstripState = rememberLazyListState()
     var playingAsset by remember { mutableStateOf<PhotoAsset?>(null) }
@@ -450,7 +506,15 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
             onClose()
         }
     }
-    val selected = pagerState.currentPage
+    val selected = pagerState.currentPage.coerceIn(0, photos.lastIndex)
+    LaunchedEffect(photos[selected], revision, locationRevision) {
+        metadata = PhotoMetadata()
+        metadata = withContext(Dispatchers.IO) { readPhotoMetadata(context, photos[selected]) }
+    }
+    LaunchedEffect(Unit) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_MEDIA_LOCATION) != PackageManager.PERMISSION_GRANTED)
+            locationPermission.launch(Manifest.permission.ACCESS_MEDIA_LOCATION)
+    }
     LaunchedEffect(selected) {
         onPageChanged(selected)
         zoom = 1f
@@ -489,7 +553,7 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
                 beyondViewportPageCount = 1,
             ) { page ->
                 AsyncImage(
-                    model = ImageRequest.Builder(LocalContext.current).data(photos[page].uri).crossfade(true).build(),
+                    model = photoRequest(photos[page]),
                     contentDescription = "Photo ${page + 1}",
                     modifier = Modifier.fillMaxSize().pointerInput(page) {
                         detectTapGestures(
@@ -505,9 +569,15 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
             Box(Modifier.fillMaxSize()) {
                 ViewerHeader(
                     asset = photos[selected],
+                    location = metadata.location,
                     onBack = onClose,
                     onPlay = if (photos[selected].mayContainLiveClip) ({ playingAsset = photos[selected] }) else null,
-                    onDelete = { onDelete(photos[selected]) },
+                    onRotate = {
+                        pendingRotation = photos[selected].uri.toString()
+                        runCatching { rotateLauncher.launch(IntentSenderRequest.Builder(MediaStore.createWriteRequest(context.contentResolver, listOf(photos[selected].uri)).intentSender).build()) }
+                            .onFailure { error = it.message; pendingRotation = null }
+                    },
+                    busy = busy,
                 )
                 Box(Modifier.align(Alignment.BottomCenter)) {
                     ViewerBottomBar(
@@ -515,11 +585,21 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
                         selected = selected,
                         filmstripState = filmstripState,
                         onSelect = { pagerState.requestScrollToPage(it) },
+                        onFavorite = {
+                            runCatching {
+                                favoriteLauncher.launch(IntentSenderRequest.Builder(MediaStore.createFavoriteRequest(context.contentResolver, listOf(photos[selected].uri), !photos[selected].favorite).intentSender).build())
+                            }.onFailure { error = it.message }
+                        },
+                        onInfo = { showInfo = true },
+                        onDelete = { onDelete(photos[selected]) },
                     )
                 }
             }
         }
         clipUri?.let { uri -> LiveClipPlayer(uri) { playingAsset = null; clipUri = null } }
+        if (busy) Box(Modifier.fillMaxSize().background(Color(0x66000000)).clickable(enabled = true) {}, contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        if (showInfo) AlertDialog(onDismissRequest = { showInfo = false }, title = { Text("Photo information") }, text = { Text(metadata.details) }, confirmButton = { TextButton(onClick = { showInfo = false }) { Text("Done") } })
+        error?.let { message -> AlertDialog(onDismissRequest = { error = null }, title = { Text("Unable to save") }, text = { Text(message) }, confirmButton = { TextButton(onClick = { error = null }) { Text("OK") } }) }
     }
 }
 
@@ -527,7 +607,7 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
 private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform: (Float, Offset) -> Unit, onLongPress: () -> Unit, onExitDetail: () -> Unit) {
     val transformState = rememberTransformableState { zoomChange, panChange, _ -> onTransform(zoomChange, panChange) }
     AsyncImage(
-        model = ImageRequest.Builder(LocalContext.current).data(asset.uri).crossfade(true).build(),
+        model = photoRequest(asset),
         contentDescription = "Photo detail",
         modifier = Modifier.fillMaxSize()
             .graphicsLayer(scaleX = zoom, scaleY = zoom, translationX = pan.x, translationY = pan.y)
@@ -538,21 +618,39 @@ private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform
 }
 
 @Composable
-private fun ViewerHeader(asset: PhotoAsset, onBack: () -> Unit, onPlay: (() -> Unit)?, onDelete: () -> Unit) {
+private fun ViewerHeader(asset: PhotoAsset, location: String, onBack: () -> Unit, onPlay: (() -> Unit)?, onRotate: () -> Unit, busy: Boolean) {
+    var menuOpen by remember { mutableStateOf(false) }
     Row(
         Modifier.fillMaxWidth().statusBarsPadding().height(96.dp).background(Color(0xEFFFFFFF)).padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         ViewerCircleButton(Icons.Outlined.ArrowBack, "Back to library", onBack)
         Column(
-            Modifier.weight(1f).padding(horizontal = 18.dp).height(56.dp).clip(RoundedCornerShape(28.dp)).background(Color(0xFFF5F5F5)),
+            Modifier.weight(1f).padding(horizontal = 18.dp).height(56.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Text(DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(asset.takenAt)), color = Color.Black, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+            if (location.isNotBlank()) Text(location, color = Color.Black, fontWeight = FontWeight.SemiBold, fontSize = 15.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(asset.takenAt)), color = Color.Black, fontSize = 11.sp, maxLines = 1)
         }
         if (onPlay != null) ViewerCircleButton(Icons.Outlined.PlayArrow, "Play live photo", onPlay) else Spacer(Modifier.size(8.dp))
-        ViewerCircleButton(Icons.Outlined.DeleteOutline, "Move photo to trash", onDelete)
+        Box {
+            ViewerCircleButton(Icons.Outlined.MoreHoriz, "More photo actions") { menuOpen = true }
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false },
+                containerColor = Color.White,
+                tonalElevation = 0.dp,
+            ) {
+                IconButton(
+                    onClick = { menuOpen = false; onRotate() },
+                    enabled = !busy,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                ) {
+                    Icon(Icons.Outlined.RotateLeft, "Rotate left 90°", tint = if (busy) Color.Gray else Color.Black)
+                }
+            }
+        }
     }
 }
 
@@ -562,6 +660,9 @@ private fun ViewerBottomBar(
     selected: Int,
     filmstripState: androidx.compose.foundation.lazy.LazyListState,
     onSelect: (Int) -> Unit,
+    onFavorite: () -> Unit,
+    onInfo: () -> Unit,
+    onDelete: () -> Unit,
 ) {
     Column(Modifier.fillMaxWidth().background(Color(0xEDFFFFFF)).navigationBarsPadding()) {
         BoxWithConstraints(Modifier.fillMaxWidth().height(68.dp)) {
@@ -578,6 +679,11 @@ private fun ViewerBottomBar(
                 }
             }
         }
+        Row(Modifier.fillMaxWidth().height(64.dp).padding(horizontal = 28.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onFavorite) { Icon(if (photos[selected].favorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder, "Toggle favorite", tint = if (photos[selected].favorite) Color.Red else Color.Black, modifier = Modifier.size(28.dp)) }
+            IconButton(onClick = onInfo) { Icon(Icons.Outlined.Info, "EXIF information", tint = Color.Black, modifier = Modifier.size(26.dp)) }
+            IconButton(onClick = onDelete) { Icon(Icons.Outlined.DeleteOutline, "Move photo to trash", tint = Color.Black, modifier = Modifier.size(26.dp)) }
+        }
     }
 }
 
@@ -585,7 +691,7 @@ private fun ViewerBottomBar(
 private fun ViewerCircleButton(icon: androidx.compose.ui.graphics.vector.ImageVector, description: String, onClick: () -> Unit) {
     IconButton(
         onClick = onClick,
-        modifier = Modifier.size(48.dp).clip(RoundedCornerShape(50)).background(Color(0xFFF5F5F5)),
+        modifier = Modifier.size(48.dp),
     ) { Icon(icon, description, tint = Color.Black, modifier = Modifier.size(26.dp)) }
 }
 
@@ -650,8 +756,31 @@ private fun LiveClipPlayer(uri: Uri, onFinished: () -> Unit) {
 }
 
 @Composable
+private fun LivePhotoBadge(modifier: Modifier = Modifier) {
+    Canvas(modifier.semantics { contentDescription = "Live photo" }) {
+        val diameter = size.minDimension
+        val stroke = diameter * 0.055f
+        val tint = Color.White.copy(alpha = 0.8f)
+        drawCircle(tint, radius = diameter * 0.12f)
+        drawCircle(tint, radius = diameter * 0.28f, style = Stroke(stroke))
+        val radius = diameter * 0.44f
+        repeat(18) { segment ->
+            drawArc(
+                color = tint,
+                startAngle = segment * 20f,
+                sweepAngle = 7f,
+                useCenter = false,
+                topLeft = center - Offset(radius, radius),
+                size = Size(radius * 2, radius * 2),
+                style = Stroke(stroke, cap = StrokeCap.Round),
+            )
+        }
+    }
+}
+
+@Composable
 private fun FilmstripThumbnail(asset: PhotoAsset, selected: Boolean, onClick: () -> Unit) = AsyncImage(
-    ImageRequest.Builder(LocalContext.current).data(asset.uri).size(160).build(), null,
+    photoRequest(asset, 160), null,
     Modifier
         .size(if (selected) 44.dp else 32.dp)
         .clip(RoundedCornerShape(2.dp))
