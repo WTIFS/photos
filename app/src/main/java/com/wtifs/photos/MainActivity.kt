@@ -93,8 +93,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-data class PhotoAsset(val uri: Uri, val takenAt: Long, val displayName: String, val favorite: Boolean = false, val modified: Long = 0) {
-    val mayContainLiveClip: Boolean get() = displayName.startsWith("MVIMG_", ignoreCase = true)
+data class PhotoAsset(val uri: Uri, val takenAt: Long, val displayName: String, val favorite: Boolean = false, val modified: Long = 0, val videoRemoved: Boolean = false) {
+    val mayContainLiveClip: Boolean get() = !videoRemoved && displayName.startsWith("MVIMG_", ignoreCase = true)
 }
 
 // A saved rotation must invalidate every size of this image, including the filmstrip.
@@ -146,7 +146,15 @@ class PhotosViewModel(application: Application) : AndroidViewModel(application) 
                 val dateColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_TAKEN)
                 val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
                 buildList {
-                    while (cursor.moveToNext()) add(PhotoAsset(ContentUris.withAppendedId(collection, cursor.getLong(idColumn)), cursor.getLong(dateColumn), cursor.getString(nameColumn), cursor.getInt(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.IS_FAVORITE)) == 1, cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED))))
+                    val stillPhotos = getApplication<Application>().getSharedPreferences("still_photos", android.content.Context.MODE_PRIVATE)
+                    while (cursor.moveToNext()) {
+                        val uri = ContentUris.withAppendedId(collection, cursor.getLong(idColumn))
+                        val name = cursor.getString(nameColumn)
+                        add(PhotoAsset(uri, cursor.getLong(dateColumn), name,
+                            cursor.getInt(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.IS_FAVORITE)) == 1,
+                            cursor.getLong(cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_MODIFIED)),
+                            stillPhotos.getBoolean("$uri|$name", false)))
+                    }
                 }
             } ?: emptyList()
         }
@@ -162,26 +170,36 @@ private fun PhotosApp(photosViewModel: PhotosViewModel = viewModel()) {
     val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES else Manifest.permission.READ_EXTERNAL_STORAGE
     var accessGranted by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) }
     var viewerIndex by rememberSaveable { mutableStateOf<Int?>(null) }
+    var pendingPreviewDeleteIndex by rememberSaveable { mutableStateOf<Int?>(null) }
+    var viewerGeneration by rememberSaveable { mutableIntStateOf(0) }
     var showingTrash by rememberSaveable { mutableStateOf(false) }
     var gridColumns by rememberSaveable { mutableIntStateOf(preferences.getInt("grid_columns", 3).coerceIn(3, 4)) }
     val libraryGridState = rememberLazyGridState()
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, accessGranted) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME && accessGranted) scope.launch { photosViewModel.loadPhotos() }
+            if (event == Lifecycle.Event.ON_RESUME && accessGranted && pendingPreviewDeleteIndex == null) scope.launch { photosViewModel.loadPhotos() }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { accessGranted = it }
     val trashLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        val deletedPreviewIndex = pendingPreviewDeleteIndex
         if (result.resultCode == Activity.RESULT_OK) {
             scope.launch {
-                photosViewModel.loadPhotos()
-                photosViewModel.loadTrashedPhotos()
+                try {
+                    photosViewModel.loadPhotos()
+                    if (deletedPreviewIndex != null) {
+                        // The next photo takes the deleted photo's index; at the end use the previous one.
+                        viewerIndex = if (photosViewModel.photos.isEmpty()) null
+                            else deletedPreviewIndex.coerceAtMost(photosViewModel.photos.lastIndex)
+                        viewerGeneration++
+                    }
+                    photosViewModel.loadTrashedPhotos()
+                } finally { pendingPreviewDeleteIndex = null }
             }
-            viewerIndex = null
-        }
+        } else pendingPreviewDeleteIndex = null
     }
     val permanentDeleteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
@@ -233,14 +251,18 @@ private fun PhotosApp(photosViewModel: PhotosViewModel = viewModel()) {
                         showingTrash = true
                     },
                 )
-                else -> PhotoViewer(
+                else -> key(viewerGeneration) { PhotoViewer(
                     photos = photosViewModel.photos,
                     initialIndex = viewerIndex!!.coerceIn(0, photosViewModel.photos.lastIndex),
                     onPageChanged = { viewerIndex = it },
                     onClose = { viewerIndex = null },
-                    onDelete = { requestTrash(listOf(it)) },
+                    onDelete = { asset ->
+                        pendingPreviewDeleteIndex = photosViewModel.photos.indexOfFirst { it.uri == asset.uri }.coerceAtLeast(0)
+                        try { requestTrash(listOf(asset)) }
+                        catch (failure: Exception) { pendingPreviewDeleteIndex = null; throw failure }
+                    },
                     onRefresh = { scope.launch { photosViewModel.loadPhotos() } },
-                )
+                ) }
             }
         }
     }
@@ -471,6 +493,7 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
     var revision by remember { mutableIntStateOf(0) }
     var busy by remember { mutableStateOf(false) }
     var pendingRotation by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingVideoRemoval by rememberSaveable { mutableStateOf(false) }
     var locationRevision by remember { mutableIntStateOf(0) }
     val locationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { locationRevision++ }
     val favoriteLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) {
@@ -478,15 +501,19 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
     }
     val rotateLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         val asset = photos.firstOrNull { it.uri.toString() == pendingRotation }
+        val removeVideo = pendingVideoRemoval
         pendingRotation = null
+        pendingVideoRemoval = false
         if (result.resultCode == Activity.RESULT_OK && asset != null) scope.launch {
             busy = true
             try {
-                withContext(Dispatchers.IO) { rotatePhotoLeft(context, asset) }
+                withContext(Dispatchers.IO) {
+                    if (removeVideo) removeLiveVideo(context, asset) else rotatePhotoLeft(context, asset)
+                }
                 imageRevisions[asset.uri] = (imageRevisions[asset.uri] ?: 0) + 1
                 revision++
                 onRefresh()
-            } catch (e: Exception) { error = e.message ?: "Could not rotate this image." }
+            } catch (e: Exception) { error = e.message ?: "Could not save this image." }
             finally { busy = false }
         }
     }
@@ -573,9 +600,16 @@ private fun PhotoViewer(photos: List<PhotoAsset>, initialIndex: Int, onPageChang
                     onBack = onClose,
                     onPlay = if (photos[selected].mayContainLiveClip) ({ playingAsset = photos[selected] }) else null,
                     onRotate = {
+                        pendingVideoRemoval = false
                         pendingRotation = photos[selected].uri.toString()
                         runCatching { rotateLauncher.launch(IntentSenderRequest.Builder(MediaStore.createWriteRequest(context.contentResolver, listOf(photos[selected].uri)).intentSender).build()) }
                             .onFailure { error = it.message; pendingRotation = null }
+                    },
+                    onRemoveVideo = {
+                        pendingVideoRemoval = true
+                        pendingRotation = photos[selected].uri.toString()
+                        runCatching { rotateLauncher.launch(IntentSenderRequest.Builder(MediaStore.createWriteRequest(context.contentResolver, listOf(photos[selected].uri)).intentSender).build()) }
+                            .onFailure { error = it.message; pendingRotation = null; pendingVideoRemoval = false }
                     },
                     busy = busy,
                 )
@@ -618,7 +652,7 @@ private fun DetailPhoto(asset: PhotoAsset, zoom: Float, pan: Offset, onTransform
 }
 
 @Composable
-private fun ViewerHeader(asset: PhotoAsset, location: String, onBack: () -> Unit, onPlay: (() -> Unit)?, onRotate: () -> Unit, busy: Boolean) {
+private fun ViewerHeader(asset: PhotoAsset, location: String, onBack: () -> Unit, onPlay: (() -> Unit)?, onRotate: () -> Unit, onRemoveVideo: () -> Unit, busy: Boolean) {
     var menuOpen by remember { mutableStateOf(false) }
     Row(
         Modifier.fillMaxWidth().statusBarsPadding().height(96.dp).background(Color(0xEFFFFFFF)).padding(horizontal = 20.dp, vertical = 12.dp),
@@ -647,7 +681,17 @@ private fun ViewerHeader(asset: PhotoAsset, location: String, onBack: () -> Unit
                     enabled = !busy,
                     modifier = Modifier.padding(horizontal = 4.dp),
                 ) {
-                    Icon(Icons.Outlined.RotateLeft, "Rotate left 90°", tint = if (busy) Color.Gray else Color.Black)
+                    // RotateLeft has more internal padding; compensate within the same icon slot.
+                    Icon(Icons.Outlined.RotateLeft, "Rotate left 90°", tint = if (busy) Color.Gray else Color.Black,
+                        modifier = Modifier.size(24.dp).graphicsLayer(scaleX = 1.15f, scaleY = 1.15f))
+                }
+                if (asset.mayContainLiveClip) IconButton(
+                    onClick = { menuOpen = false; onRemoveVideo() },
+                    enabled = !busy,
+                    modifier = Modifier.padding(horizontal = 4.dp),
+                ) {
+                    Icon(Icons.Outlined.MotionPhotosOff, "Remove live video and overwrite JPEG", tint = if (busy) Color.Gray else Color.Black,
+                        modifier = Modifier.size(24.dp))
                 }
             }
         }

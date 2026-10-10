@@ -47,15 +47,7 @@ fun readPhotoMetadata(context: Context, asset: PhotoAsset): PhotoMetadata {
 
 /** Prepare and validate a replacement before opening the original for writing. */
 fun rotatePhotoLeft(context: Context, asset: PhotoAsset) {
-    require(ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_MEDIA_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-        "Allow photo location access in Android settings before rotating, so the original GPS metadata can be preserved."
-    }
-    val backup = File.createTempFile("rotation-original-", ".bak", context.cacheDir)
-    val edited = File.createTempFile("rotation-edited-", ".img", context.cacheDir)
-    val originalUri = MediaStore.setRequireOriginal(asset.uri)
-    context.contentResolver.openInputStream(originalUri)!!.use { input -> backup.outputStream().use { input.copyTo(it) } }
-    backup.copyTo(edited, overwrite = true)
-    try {
+    replacePhoto(context, asset) { edited ->
         val exif = ExifInterface(edited)
         exif.rotate(-90)
         val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, 1)
@@ -65,6 +57,27 @@ fun rotatePhotoLeft(context: Context, asset: PhotoAsset) {
             exif.saveAttributes()
         }
         check(ExifInterface(edited).getAttributeInt(ExifInterface.TAG_ORIENTATION, 0) == orientation)
+    }
+}
+
+fun removeLiveVideo(context: Context, asset: PhotoAsset) {
+    replacePhoto(context, asset, ::removeMotionTail)
+    context.getSharedPreferences("still_photos", Context.MODE_PRIVATE).edit()
+        .putBoolean("${asset.uri}|${asset.displayName}", true).commit()
+    File(context.cacheDir, "live-${asset.uri.lastPathSegment}.mp4").delete()
+}
+
+private fun replacePhoto(context: Context, asset: PhotoAsset, edit: (File) -> Unit) {
+    require(ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_MEDIA_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+        "Allow photo location access in Android settings before editing, so the original GPS metadata can be preserved."
+    }
+    val backup = File.createTempFile("rotation-original-", ".bak", context.cacheDir)
+    val edited = File.createTempFile("rotation-edited-", ".img", context.cacheDir)
+    val originalUri = MediaStore.setRequireOriginal(asset.uri)
+    try {
+        context.contentResolver.openInputStream(originalUri)!!.use { input -> backup.outputStream().use { input.copyTo(it) } }
+        backup.copyTo(edited, overwrite = true)
+        edit(edited)
         try {
             context.contentResolver.openOutputStream(asset.uri, "wt")!!.use { output -> edited.inputStream().use { it.copyTo(output) } }
         } catch (failure: Exception) {
